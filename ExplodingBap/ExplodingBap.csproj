@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+	  <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BAP.Helpers" Version="0.1.9-beta" />
+    <PackageReference Include="BAP.Types" Version="1.13.0-beta" />
+    <PackageReference Include="BAP.UIHelpers" Version="0.1.9-beta" />
+    <PackageReference Include="MessagePipe" Version="1.7.4" />
+    <PackageReference Include="MessagePipe.Analyzer" Version="1.7.4">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="7.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Update="wwwroot\Images\ExplodingBap.bmp">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>
