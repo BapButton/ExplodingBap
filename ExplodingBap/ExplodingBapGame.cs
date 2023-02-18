@@ -1,4 +1,6 @@
-﻿using System.IO;
+﻿using System.Collections.Concurrent;
+using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using BAP.Helpers;
 using BAP.Types;
@@ -7,16 +9,33 @@ using Microsoft.Extensions.Logging;
 
 namespace ExplodingBap
 {
-    internal class OverlappingImage
+
+    internal class ExplodingBapRow
     {
-        internal int ImageId { get; set; }
-        internal List<OverlappingImageNode> OverlappingImageNodes { get; set; } = new();
+        internal bool ReversedDirection { get; set; }
+        internal List<ExplodingBapImageInfo> OrderedImages { get; set; } = default!;
+        internal List<string> NodeIdsOrderedLeftToRight { get; set; } = new();
     }
-    internal class OverlappingImageNode
+
+    internal class ExplodingBapImageInfo
     {
-        internal string NodeId { get; set; } = "";
-        internal int InitialPositionFromLeft { get; set; }
-        internal int NumberOfPixelColumnsShowing { get; set; }
+        public int ImageId { get; set; }
+        public int ImageTrackingId { get; set; }
+        public bool IsHidden { get; set; }
+        public List<string> CurrentNodes { get; set; } = new();
+    }
+
+    internal class ActiveButtonPress
+    {
+        public string NodeId { get; set; } = "";
+        public int PressedAtFrame { get; set; }
+        public List<(int imageId, int imageTrackingId)> ImageIds { get; set; } = new();
+    }
+
+    internal class ColumnInfo
+    {
+        public int ColumnId { get; set; }
+        public List<string> NodeIds { get; set; } = new();
     }
 
     internal class ExplosionTracker
@@ -26,54 +45,59 @@ namespace ExplodingBap
         internal int FrameIdOfCurrentExplosion { get; set; }
     }
 
-    internal class ExplodingBapRow
-    {
-        internal bool ReversedDirection { get; set; }
-        internal int[] ImageTrackingArray { get; set; } = default!;
-        internal List<string> NodeIdsOrderedLeftToRight { get; set; } = new();
 
-    }
     public class ExplodingBapGame : IBapGame
     {
 
         public bool IsGameRunning { get; set; }
         ILogger<ExplodingBapGame> Logger { get; set; }
         IBapMessageSender MsgSender { get; set; } = default!;
-        List<string> NodeIdsPressed { get; set; } = new();
-        public int FrameSpacing { get; set; } = 0;
+        ConcurrentQueue<string> NodeIdsPressed { get; set; } = new();
         List<ulong[,]> PossibleImages { get; set; } = new();
-        IGameProvider GameHandler { get; set; } = default!;
         ILayoutProvider LayoutProvider { get; set; } = default!;
         bool ExplosionInProcess;
         ExplosionTracker? currentExplosionTracker = null;
         CancellationTokenSource timerTokenSource = new();
         IDisposable subscriptions = default!;
+        List<ActiveButtonPress> ActiveButtonPresses { get; set; } = new();
         List<ExplodingBapRow> Rows { get; set; } = new();
-        List<string> firstAndLastColumnNodeIds = new();
+        List<ColumnInfo> Columns { get; set; } = new();
+        List<int> firstAndLastColumnIds = new();
         int FrameTrackingCount = 0;
         ISubscriber<ButtonPressedMessage> ButtonPressedPipe { get; set; } = default!;
-        public int SpeedMultiplier = 4;
+        public int SpeedMultiplier = 8;
+        public int ImageTrackingId = 0;
+        public int offset = 0;
+        public int CorrectPresses = 0;
         PeriodicTimer? timer = null;
-
-        //int minOverlap = 1;
-        readonly int failOverlap = 8;
-        public ExplodingBapGame(ILogger<ExplodingBapGame> logger, IBapMessageSender messageSender, IGameProvider gameHandler, ILayoutProvider layoutProvider, ISubscriber<ButtonPressedMessage> buttonPressedPipe)
+        public ExplodingBapGame(ILogger<ExplodingBapGame> logger, IBapMessageSender messageSender, ILayoutProvider layoutProvider, ISubscriber<ButtonPressedMessage> buttonPressedPipe)
         {
             Logger = logger;
             MsgSender = messageSender;
             LayoutProvider = layoutProvider;
-            GameHandler = gameHandler;
             ButtonPressedPipe = buttonPressedPipe;
             var bag = DisposableBag.CreateBuilder();
             ButtonPressedPipe.Subscribe((x) => ButtonPressed(x)).AddTo(bag);
             subscriptions = bag.Build();
         }
 
+        private void ClearOutTheStuffForANewRound()
+        {
+            ExplosionInProcess = false;
+            CorrectPresses = 0;
+            offset = 8;
+            Columns = new();
+            currentExplosionTracker = null;
+        }
+
+
         public async Task<bool> Start()
         {
+            ClearOutTheStuffForANewRound();
             IsGameRunning = true;
-            ExplosionInProcess = false;
-            Rows = new List<ExplodingBapRow>();
+
+            Rows = new();
+
             if (PossibleImages.Count == 0)
             {
                 string path = FilePathHelper.GetFullPath<ExplodingBapGame>("ExplodingBap.bmp");
@@ -85,24 +109,37 @@ namespace ExplodingBap
                 await ForceEndGame();
                 return false;
             }
+
             foreach (var row in LayoutProvider.CurrentButtonLayout.ButtonPositions.GroupBy(t => t.RowId).OrderBy(t => t.Key))
             {
-                firstAndLastColumnNodeIds.Add(row.OrderBy(t => t.ColumnId).First().ButtonId);
-                firstAndLastColumnNodeIds.Add(row.OrderByDescending(t => t.ColumnId).First().ButtonId);
-                int arrayWidth = (row.Count() * 8 + FrameSpacing) - FrameSpacing;
-                var newRow = new ExplodingBapRow()
+                int arrayWidth = row.Count() + 1;
+                ExplodingBapRow newRow = new()
                 {
                     ReversedDirection = row.Key % 2 == 0,
-                    ImageTrackingArray = new int[arrayWidth],
-                    NodeIdsOrderedLeftToRight = row.Select(t => t.ButtonId).ToList()
+                    OrderedImages = new(arrayWidth),
+                    NodeIdsOrderedLeftToRight = row.OrderBy(t => t.ColumnId).Select(t => t.ButtonId).ToList()
                 };
+
+                foreach (var node in row)
+                {
+                    ColumnInfo? ci = Columns.FirstOrDefault(t => t.ColumnId == node.ColumnId);
+                    if (ci == null)
+                    {
+                        ci = new() { ColumnId = node.ColumnId };
+                        Columns.Add(ci);
+                    }
+                    ci.NodeIds.Add(node.ButtonId);
+                }
                 for (int i = 0; i < arrayWidth; i++)
                 {
-                    newRow.ImageTrackingArray[i] = -1;
+                    newRow.OrderedImages.Add(new ExplodingBapImageInfo() { ImageId = 1, IsHidden = true, ImageTrackingId = ++ImageTrackingId });
                 }
+                newRow.OrderedImages[0].ImageId = BapBasicGameHelper.GetRandomInt(0, PossibleImages.Count);
+                newRow.OrderedImages[0].IsHidden = false;
                 Rows.Add(newRow); ;
             }
-
+            firstAndLastColumnIds.Add(Columns.OrderBy(t => t.ColumnId).First().ColumnId);
+            firstAndLastColumnIds.Add(Columns.OrderByDescending(t => t.ColumnId).First().ColumnId);
             MoveToNextFrame();
             //As we are not awaiting this task. It will just keep running until the cancellation token fires.
             Task TimerTask = StartGameFrameTicker();
@@ -137,135 +174,26 @@ namespace ExplodingBap
         private void ShiftEverythingAndShowIt()
         {
             List<(string nodeId, ButtonImage image)> images = new();
+            if (offset == 0)
+            {
+                foreach (var row in Rows)
+                {
+                    //if an image has fallen off the map then add a new one.
+                    row.OrderedImages.RemoveAt(row.OrderedImages.Count - 1);
+                    row.OrderedImages.Insert(0, new ExplodingBapImageInfo() { ImageId = BapBasicGameHelper.GetRandomInt(0, PossibleImages.Count), ImageTrackingId = ++ImageTrackingId });
+
+                }
+                offset = 7;
+            }
+            else
+            {
+                offset--;
+            }
             foreach (var row in Rows)
             {
-                int fullFrameLength = row.ImageTrackingArray.Length;
-                int lastItemInArray = fullFrameLength - 1;
-                //Regular direction left to right
-                if (!row.ReversedDirection)
-                {
-                    //Shift it all
-                    for (int i = 0; i < fullFrameLength - 1; i++)
-                    {
-                        row.ImageTrackingArray[i] = row.ImageTrackingArray[i + 1];
-                    }
-                    int currentImage = -1;
-                    //There used to be an image here;
-                    if (row.ImageTrackingArray[lastItemInArray] > -1)
-                    {
-                        currentImage = row.ImageTrackingArray[lastItemInArray];
-                        int endOfImage = lastItemInArray;
-                        for (int i = lastItemInArray; i >= lastItemInArray - 8; i--)
-                        {
-                            if (row.ImageTrackingArray[i] != currentImage)
-                            {
-                                endOfImage = i;
-                                break;
-                            }
-                        }
-                        //If the image is already taking up 8 columns then we need to put in a blank column;
-                        if (endOfImage == lastItemInArray)
-                        {
-                            if (FrameSpacing > 0)
-                            {
-                                row.ImageTrackingArray[lastItemInArray] = -1;
-                            }
-                            else
-                            {
-                                //temp - Always use the same image;
-                                row.ImageTrackingArray[lastItemInArray] = 4;
-                                //row.ImageTrackingArray[lastItemInArray] = BapBasicGameHelper.GetRandomInt(0, PossibleImages.Count, currentImage, 50);
-
-                            }
-                        }
-                    }
-                    //If there was already a blank column then if there is now the framespacing of blank columns then a new random image is needed.
-                    else
-                    {
-                        int endOfBlankSpace = 0;
-                        for (int i = lastItemInArray; i > (lastItemInArray - FrameSpacing); i--)
-                        {
-                            if (row.ImageTrackingArray[i] > currentImage)
-                            {
-                                endOfBlankSpace = i;
-                            }
-                        }
-                        if (endOfBlankSpace == 0 || FrameSpacing == 0)
-                        {
-                            //temp - just set it to the same thing;
-                            row.ImageTrackingArray[lastItemInArray] = 4;
-                            //row.ImageTrackingArray[lastItemInArray] = BapBasicGameHelper.GetRandomInt(0, PossibleImages.Count, currentImage, 50);
-                        }
-                        else
-                        {
-                            row.ImageTrackingArray[lastItemInArray] = -1;
-                        }
-                    }
-                }
-                //reversed Direction Right to left 
-                else
-                {
-                    for (int i = lastItemInArray; i > 0; i--)
-                    {
-                        row.ImageTrackingArray[i] = row.ImageTrackingArray[i - 1];
-                    }
-                    int currentImage = -1;
-                    //There used to be an image here;
-                    if (row.ImageTrackingArray[0] > -1)
-                    {
-                        currentImage = row.ImageTrackingArray[0];
-                        int endOfImage = 0;
-                        for (int i = 0; i <= 8; i++)
-                        {
-                            if (row.ImageTrackingArray[i] != currentImage)
-                            {
-                                endOfImage = i;
-                                break;
-                            }
-                        }
-                        //If the image is already taking up 8 columns then we need to put in a blank column;
-                        if (endOfImage == 0)
-                        {
-                            if (FrameSpacing > 0)
-                            {
-                                row.ImageTrackingArray[0] = -1;
-                            }
-                            else
-                            {
-                                //temp
-                                row.ImageTrackingArray[0] = 4;// BapBasicGameHelper.GetRandomInt(0, PossibleImages.Count, currentImage, 50);
-
-                            }
-
-                        }
-                    }
-                    //If there was already a blank column and there is now the framespacing of blank columns then a new random image is needed.
-                    else
-                    {
-                        int endOfBlankSpace = FrameSpacing;
-                        for (int i = 0; i < FrameSpacing; i++)
-                        {
-                            if (row.ImageTrackingArray[i] > -1)
-                            {
-                                endOfBlankSpace = i;
-                                break;
-                            }
-                        }
-                        if (endOfBlankSpace == FrameSpacing)
-                        {
-                            row.ImageTrackingArray[0] = 4;//BapBasicGameHelper.GetRandomInt(0, PossibleImages.Count, currentImage, 50);
-                        }
-                        else
-                        {
-                            //More spacing is neeeded
-                            row.ImageTrackingArray[0] = -1;
-                        }
-                    }
-                }
-
                 images.AddRange(GenerateImagesForRow(row));
-
             }
+
 
             foreach (var image in images)
             {
@@ -275,55 +203,45 @@ namespace ExplodingBap
 
         private List<(string NodeId, ButtonImage buttonImage)> GenerateImagesForRow(ExplodingBapRow row)
         {
-            int fullFrameLength = row.ImageTrackingArray.Length;
+            int fullFrameLength = row.NodeIdsOrderedLeftToRight.Count * 8;
             List<(string nodeId, ButtonImage buttonImage)> images = new();
             ulong[,] bigMatrix = new ulong[8, fullFrameLength];
-
-            for (int i = 0; i < row.ImageTrackingArray.Length;)
+            for (int i = 0; i < row.OrderedImages.Count; i++)
             {
-
-                if (row.ImageTrackingArray[i] > -1)
+                var imageInfo = row.OrderedImages[i];
+                if (imageInfo != null && !imageInfo.IsHidden)
                 {
-                    int imageId = row.ImageTrackingArray[i];
-                    ulong[,] image = PossibleImages[imageId];
-                    if (i == 0)
+                    imageInfo.CurrentNodes = new List<string>();
+                    ulong[,] image = PossibleImages[imageInfo.ImageId];
+                    int startingPosition = 0;
+                    //An offset of 7 means that we are displaying fully on the button and about to get a new image
+                    if (row.ReversedDirection)
                     {
-                        //Check if it is a partial image and then show as much of it as needed. Then move i forward.
-                        int startingPosition = 0;
-                        for (int j = 0; j < 8; j++)
+                        startingPosition = (fullFrameLength - 8 + offset) - (8 * i);
+                        int mainLocation = (row.NodeIdsOrderedLeftToRight.Count - 1) - i;
+                        if (mainLocation >= 0)
                         {
-                            if (row.ImageTrackingArray[j] != imageId)
-                            {
-                                startingPosition = j - 8;
-                                i = j;
-                                break;
-                            }
+                            imageInfo.CurrentNodes.Add(row.NodeIdsOrderedLeftToRight[mainLocation]);
                         }
-                        if (startingPosition == 0)
+                        if (offset > 0 && mainLocation + 1 < row.NodeIdsOrderedLeftToRight.Count)
                         {
-                            i = 8;
+                            imageInfo.CurrentNodes.Add(row.NodeIdsOrderedLeftToRight[mainLocation + 1]);
                         }
-                        if (i == -1)
-                        {
-                            i = 0;
-                        }
-                        if (i == 0)
-                        {
-                            i = 1;
-                        }
-                        AnimationHelper.MergeMatrices(bigMatrix, image, 0, startingPosition, false);
                     }
                     else
                     {
-                        //The Merge Matricies will drop any portion of the override matrix that does not fit in the frame. 
-                        AnimationHelper.MergeMatrices(bigMatrix, image, 0, i, false);
-                        //If this is greater the I then we have reached the end
-                        i += 8;
+                        startingPosition = 0 - offset + (8 * i);
+                        if (i < row.NodeIdsOrderedLeftToRight.Count)
+                        {
+                            imageInfo.CurrentNodes.Add(row.NodeIdsOrderedLeftToRight[i]);
+                        }
+                        if (offset > 0 && i - 1 >= 0)
+                        {
+                            imageInfo.CurrentNodes.Add(row.NodeIdsOrderedLeftToRight[i - 1]);
+                        }
                     }
-                }
-                else
-                {
-                    i++;
+
+                    AnimationHelper.MergeMatrices(bigMatrix, image, 0, startingPosition, false);
                 }
             }
             //Now that the big matrix is made we can cut it up into frames;
@@ -336,11 +254,11 @@ namespace ExplodingBap
 
         private void MoveToNextFrame()
         {
+
             if (!ExplosionInProcess)
             {
-                var overlappingImages = GetCurrentlyOverlappingNodes();
-                EvaluateButtonPresses(overlappingImages);
-                EvaluateIfTheGameHasEnded(overlappingImages);
+                EvaluateButtonPresses();
+                EvaluateIfTheGameHasEnded();
             }
 
             if (ExplosionInProcess)
@@ -365,73 +283,7 @@ namespace ExplodingBap
         }
         private void ButtonPressed(ButtonPressedMessage buttonPressedMessage)
         {
-            NodeIdsPressed.Add(buttonPressedMessage.NodeId);
-        }
-
-        private List<OverlappingImage> GetCurrentlyOverlappingNodes()
-        {
-            List<OverlappingImage> overlappingImages = new();
-            int longestRow = Rows.Select(t => t.ImageTrackingArray.Length).Max();
-            int mostButtons = longestRow / 8;
-            for (int i = 0; i < mostButtons; i++)
-            {
-                List<OverlappingImage>? currentlyShowingImagesOnAllButtonsInThisColumn = null;
-                foreach (var row in Rows)
-                {
-                    Dictionary<int, (int pixelsShowing, int startingPosition)> currentlyShowingImagesOnThisButton = new();
-                    for (int j = i * 8; j < (i * 8) + 8; j++)
-                    {
-                        int currentValue = row.ImageTrackingArray[j];
-                        if (currentValue > -1)
-                        {
-                            if (currentlyShowingImagesOnThisButton.ContainsKey(currentValue))
-                            {
-                                var currentItem = currentlyShowingImagesOnThisButton[currentValue];
-                                currentlyShowingImagesOnThisButton[currentValue] = (currentItem.pixelsShowing + 1, currentItem.startingPosition);
-                            }
-                            else
-                            {
-                                currentlyShowingImagesOnThisButton.Add(currentValue, (1, j));
-                            }
-                        }
-
-                    }
-                    if (currentlyShowingImagesOnAllButtonsInThisColumn == null)
-                    {
-                        currentlyShowingImagesOnAllButtonsInThisColumn = new();
-                        foreach (var item in currentlyShowingImagesOnThisButton)
-                        {
-                            OverlappingImageNode node = new() { NodeId = row.NodeIdsOrderedLeftToRight[i], InitialPositionFromLeft = item.Value.startingPosition, NumberOfPixelColumnsShowing = item.Value.pixelsShowing };
-                            currentlyShowingImagesOnAllButtonsInThisColumn.Add(new OverlappingImage() { ImageId = item.Key, OverlappingImageNodes = new() { node } });
-                        }
-                    }
-                    else
-                    {
-                        foreach (var item in currentlyShowingImagesOnThisButton)
-                        {
-                            var currentItem = currentlyShowingImagesOnAllButtonsInThisColumn.FirstOrDefault(t => t.ImageId == item.Key);
-                            if (currentItem != null)
-                            {
-                                currentItem.OverlappingImageNodes.Add(new() { NodeId = row.NodeIdsOrderedLeftToRight[i], NumberOfPixelColumnsShowing = item.Value.pixelsShowing, InitialPositionFromLeft = item.Value.startingPosition });
-                            }
-                        }
-                        List<int> imageIdsShowingThisRound = currentlyShowingImagesOnThisButton.Select(t => t.Key).ToList();
-                        //Drop anything not found on this Loop;
-                        currentlyShowingImagesOnAllButtonsInThisColumn = currentlyShowingImagesOnAllButtonsInThisColumn.Where(t => imageIdsShowingThisRound.Contains(t.ImageId)).ToList();
-                    }
-                    if (currentlyShowingImagesOnAllButtonsInThisColumn.Count == 0)
-                    {
-                        break;
-                    }
-                }
-                if (currentlyShowingImagesOnAllButtonsInThisColumn?.Count > 0)
-                {
-                    overlappingImages.AddRange(currentlyShowingImagesOnAllButtonsInThisColumn);
-                }
-            }
-
-
-            return overlappingImages;
+            NodeIdsPressed.Enqueue(buttonPressedMessage.NodeId);
         }
 
         private void ShowTheExplosion()
@@ -443,6 +295,10 @@ namespace ExplodingBap
             }
             if (currentExplosionTracker != null)
             {
+                if (currentExplosionTracker.ActiveNodeIds.Count == 0)
+                {
+                    currentExplosionTracker.ActiveNodeIds = currentExplosionTracker.InitialNodeIds;
+                }
                 bool endTheGame = false;
                 foreach (var nodeId in currentExplosionTracker.ActiveNodeIds)
                 {
@@ -522,88 +378,69 @@ namespace ExplodingBap
         }
 
 
-        private void EvaluateIfTheGameHasEnded(List<OverlappingImage> overlappingImages)
+        private void EvaluateIfTheGameHasEnded()
         {
-            foreach (var overlappingImage in overlappingImages)
+            if (offset == 0)
             {
-
-                if (overlappingImage.OverlappingImageNodes.Where(t => t.NumberOfPixelColumnsShowing >= failOverlap).Count() == overlappingImage.OverlappingImageNodes.Count())
+                foreach (var column in Columns.Where(t => !firstAndLastColumnIds.Contains(t.ColumnId)))
                 {
-                    if (overlappingImage.OverlappingImageNodes.Select(t => t.NodeId).Intersect(firstAndLastColumnNodeIds).Count() == 0)
+                    List<(int imageId, string nodeId)> foundImages = new();
+                    foreach (var nodeId in column.NodeIds)
                     {
-                        //temp - no explosions for a bit
-                        //ExplosionInProcess = true;
-                        //var nodes = overlappingImage.OverlappingImageNodes.Select(t => t.NodeId).ToList();
-                        //currentExplosionTracker = new ExplosionTracker()
-                        //{
-                        //    ActiveNodeIds = nodes,
-                        //    InitialNodeIds = nodes
-                        //};
-
+                        var showingImage = Rows.SelectMany(t => t.OrderedImages).Where(t => t.IsHidden == false && t.CurrentNodes.Contains(nodeId)).FirstOrDefault();
+                        if (showingImage != null)
+                        {
+                            if (foundImages.Any(t => t.imageId == showingImage.ImageId))
+                            {
+                                ExplosionInProcess = true;
+                                if (currentExplosionTracker == null)
+                                {
+                                    currentExplosionTracker = new ExplosionTracker();
+                                }
+                                currentExplosionTracker.InitialNodeIds.Add(nodeId);
+                                currentExplosionTracker.InitialNodeIds.AddRange(foundImages.Where(t => t.imageId == showingImage.ImageId).Select(t => t.nodeId));
+                                return;
+                            }
+                            foundImages.Add((showingImage.ImageId, nodeId));
+                        }
                     }
                 }
-
             }
 
         }
 
-        private void EvaluateButtonPresses(List<OverlappingImage> overlappingImages)
+        private void EvaluateButtonPresses()
         {
-            if (NodeIdsPressed.Count > 0)
+            //nodeIds live for a while
+            while (NodeIdsPressed.TryDequeue(out string? nodeId))
             {
-                List<string> nodeIdsToRemove = new List<string>();
-                foreach (var nodeId in NodeIdsPressed)
+                List<(int imageIds, int imageTrackerId)> imageIds = Rows.SelectMany(t => t.OrderedImages).Where(t => t.IsHidden == false && t.CurrentNodes.Contains(nodeId)).Select(t => (t.ImageId, t.ImageTrackingId)).ToList();
+                ActiveButtonPresses.Add(new()
                 {
-                    if (!overlappingImages.SelectMany(t => t.OverlappingImageNodes).Select(t => t.NodeId).Contains(nodeId))
+                    NodeId = nodeId,
+                    PressedAtFrame = FrameTrackingCount,
+                    ImageIds = imageIds
+                }); ;
+            }
+            foreach (var ci in Columns)
+            {
+                var pressedNodesInThisColumn = ActiveButtonPresses.Where(t => ci.NodeIds.Contains(t.NodeId)).ToList();
+                if (pressedNodesInThisColumn.Count() > 1)
+                {
+                    foreach (var imageGroup in pressedNodesInThisColumn.SelectMany(t => t.ImageIds).GroupBy(t => t.imageId).Where(t => t.Count() > 1))
                     {
-                        nodeIdsToRemove.Add(nodeId);
-                    }
-                }
-                foreach (var nodeId in nodeIdsToRemove)
-                {
-                    NodeIdsPressed.Remove(nodeId);
-                }
-                List<OverlappingImage> completedOverlappingNodes = new();
-                foreach (var overlap in overlappingImages)
-                {
-                    List<string> allRequiredNodeIds = overlap.OverlappingImageNodes.Select(t => t.NodeId).ToList();
-                    if (NodeIdsPressed.Intersect(allRequiredNodeIds).Count() == allRequiredNodeIds.Count)
-                    {
-                        completedOverlappingNodes.Add(overlap);
-                    }
-
-                }
-
-                if (completedOverlappingNodes.Count > 0)
-                {
-                    foreach (var completedImage in completedOverlappingNodes)
-                    {
-                        foreach (var nodeImage in completedImage.OverlappingImageNodes)
+                        foreach (var imagesToRemove in imageGroup)
                         {
-                            var currentRow = Rows.FirstOrDefault(t => t.NodeIdsOrderedLeftToRight.Contains(nodeImage.NodeId));
-                            if (currentRow != null)
+                            foreach (var imageToHide in Rows.SelectMany(t => t.OrderedImages).Where(t => t.ImageTrackingId == imagesToRemove.imageTrackingId))
                             {
-                                int initialPosition = nodeImage.InitialPositionFromLeft;
-                                if ((nodeImage.InitialPositionFromLeft) % 8 == 0 || nodeImage.InitialPositionFromLeft == 0)
-                                {
-                                    //this means that it is covering the left side of the button.
-                                    initialPosition = nodeImage.InitialPositionFromLeft + nodeImage.NumberOfPixelColumnsShowing - 8;
-
-                                }
-                                initialPosition = initialPosition < 0 ? 0 : initialPosition;
-                                for (int i = initialPosition; i < Math.Min(initialPosition + 8, currentRow.ImageTrackingArray.Length); i++)
-                                {
-                                    currentRow.ImageTrackingArray[i] = -1;
-                                }
+                                imageToHide.IsHidden = true;
                             }
-
                         }
-                        overlappingImages.Remove(completedImage);
                     }
-
                 }
             }
-
+            //Clean up old NodeIds
+            ActiveButtonPresses.RemoveAll(t => t.PressedAtFrame + (6 * SpeedMultiplier) < FrameTrackingCount);
         }
 
 

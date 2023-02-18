@@ -46,7 +46,7 @@ namespace ExplodingBap.Components
         {
             if (GameHandler.CurrentGame == null)
             {
-                GameHandler.UpdateToNewGameType(typeof(ExplodingBapGameV2));
+                GameHandler.UpdateToNewGameType(typeof(ExplodingBapGame));
             }
             if (GameHandler.CurrentGame != null)
             {
