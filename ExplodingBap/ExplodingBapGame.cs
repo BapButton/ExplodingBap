@@ -437,6 +437,10 @@ namespace ExplodingBap
                             }
                         }
                     }
+                    foreach (var nodeToRemove in pressedNodesInThisColumn)
+                    {
+                        ActiveButtonPresses.Remove(nodeToRemove);
+                    }
                 }
             }
             //Clean up old NodeIds
