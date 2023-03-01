@@ -7,14 +7,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="BAP.DefaultGameProvider" Version="0.1.9-beta" />
-    <PackageReference Include="BAP.DefaultLayoutProvider" Version="0.1.9-beta" />
-    <PackageReference Include="BAP.TestUtilities" Version="0.1.9-beta" />
-    <PackageReference Include="BAP.UIHelpers" Version="0.1.9-beta" />
-    <PackageReference Include="BAP.WebAudioPlayer" Version="0.1.9-beta" />
-    <PackageReference Include="BAP.WebCore" Version="0.1.9-beta" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="7.0.2" />
-    <PackageReference Include="NLog.Web.AspNetCore" Version="5.2.1" />
+    <PackageReference Include="BAP.DefaultGameProvider" Version="0.1.15-beta" />
+    <PackageReference Include="BAP.DefaultLayoutProvider" Version="0.1.15-beta" />
+    <PackageReference Include="BAP.TestUtilities" Version="0.1.15-beta" />
+    <PackageReference Include="BAP.UIHelpers" Version="0.1.15-beta" />
+    <PackageReference Include="BAP.WebAudioPlayer" Version="0.1.15-beta" />
+    <PackageReference Include="BAP.WebCore" Version="0.1.15-beta" />
   </ItemGroup>
 
   <ItemGroup>
